@@ -260,7 +260,7 @@ def get_ableton_connection():
 
 @mcp.tool()
 def get_session_info(ctx: Context) -> str:
-    """Get detailed information about the current Ableton session"""
+    """Get detailed information about the current Ableton session including all track names and indices"""
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("get_session_info")
@@ -273,7 +273,7 @@ def get_session_info(ctx: Context) -> str:
 def get_track_info(ctx: Context, track_index: int) -> str:
     """
     Get detailed information about a specific track in Ableton.
-    
+
     Parameters:
     - track_index: The index of the track to get information about
     """
@@ -286,17 +286,63 @@ def get_track_info(ctx: Context, track_index: int) -> str:
         return f"Error getting track info: {str(e)}"
 
 @mcp.tool()
+def get_device_parameters(ctx: Context, track_index: int, device_index: int) -> str:
+    """
+    Get all parameters for a device on a track.
+
+    Parameters:
+    - track_index: The index of the track containing the device
+    - device_index: The index of the device on the track (0 = first device)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_device_parameters", {
+            "track_index": track_index,
+            "device_index": device_index
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting device parameters from Ableton: {str(e)}")
+        return f"Error getting device parameters: {str(e)}"
+
+@mcp.tool()
+def set_device_parameter(ctx: Context, track_index: int, device_index: int, parameter_name: str, value: float) -> str:
+    """
+    Set a parameter value on a device.
+
+    Parameters:
+    - track_index: The index of the track containing the device
+    - device_index: The index of the device on the track (0 = first device)
+    - parameter_name: The name of the parameter to set (case-insensitive)
+    - value: The value to set (will be clamped to valid range)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_device_parameter", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "parameter_name": parameter_name,
+            "value": value
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting device parameter in Ableton: {str(e)}")
+        return f"Error setting device parameter: {str(e)}"
+
+@mcp.tool()
 def create_midi_track(ctx: Context, index: int = -1) -> str:
     """
     Create a new MIDI track in the Ableton session.
 
     Parameters:
     - index: The index to insert the track at (-1 = end of list)
+
+    Returns the created track index - use this index for subsequent operations on this track.
     """
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("create_midi_track", {"index": index})
-        return f"Created new MIDI track: {result.get('name', 'unknown')}"
+        return f"Created MIDI track '{result.get('name', 'unknown')}' at index {result.get('index', -1)}"
     except Exception as e:
         logger.error(f"Error creating MIDI track: {str(e)}")
         return f"Error creating MIDI track: {str(e)}"
@@ -309,11 +355,13 @@ def create_audio_track(ctx: Context, index: int = -1) -> str:
 
     Parameters:
     - index: The index to insert the track at (-1 = end of list)
+
+    Returns the created track index - use this index for subsequent operations on this track.
     """
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("create_audio_track", {"index": index})
-        return f"Created new audio track: {result.get('name', 'unknown')}"
+        return f"Created audio track '{result.get('name', 'unknown')}' at index {result.get('index', -1)}"
     except Exception as e:
         logger.error(f"Error creating audio track: {str(e)}")
         return f"Error creating audio track: {str(e)}"
@@ -813,6 +861,105 @@ def load_drum_kit(ctx: Context, track_index: int, rack_uri: str, kit_path: str) 
     except Exception as e:
         logger.error(f"Error loading drum kit: {str(e)}")
         return f"Error loading drum kit: {str(e)}"
+
+
+@mcp.tool()
+def get_all_browser_items(ctx: Context, category_name: str = "audio_effects", max_depth: int = 10) -> str:
+    """
+    Get all loadable browser items from a category.
+
+    Parameters:
+    - category_name: Category to search (audio_effects, midi_effects, instruments, drums, sounds)
+    - max_depth: Maximum depth to search (default: 10)
+
+    Returns a list of all loadable devices/instruments in the specified category.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_all_browser_items", {
+            "category_name": category_name,
+            "max_depth": max_depth
+        })
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting browser items: {str(e)}")
+        return f"Error getting browser items: {str(e)}"
+
+
+@mcp.tool()
+def fuzzy_search_browser(ctx: Context, device_name: str, category_name: str = "audio_effects", threshold: float = 0.6) -> str:
+    """
+    Search for a device in the browser using fuzzy matching.
+
+    Parameters:
+    - device_name: Name of the device to search for (e.g., "compressor", "EQ Eight")
+    - category_name: Category to search in (audio_effects, midi_effects, instruments, drums, sounds)
+    - threshold: Minimum confidence score for a match (0.0-1.0, default: 0.6)
+
+    Returns the best match with confidence score, or top 5 suggestions if no match found.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("fuzzy_search_browser", {
+            "device_name": device_name,
+            "category_name": category_name,
+            "threshold": threshold
+        })
+
+        if result.get("found"):
+            return f"Found: {result['match']['name']} (confidence: {result['confidence']:.2f})"
+        else:
+            top_matches = result.get("top_matches", [])
+            if top_matches:
+                matches_str = "\n".join([f"  - {m['name']} (confidence: {m['confidence']:.2f})" for m in top_matches])
+                return f"No match found. Top suggestions:\n{matches_str}"
+            else:
+                return f"No match found for '{device_name}' in {category_name}"
+    except Exception as e:
+        logger.error(f"Error searching browser: {str(e)}")
+        return f"Error searching browser: {str(e)}"
+
+
+@mcp.tool()
+def load_device_by_name(ctx: Context, track_index: int, device_name: str, category_name: str = "audio_effects") -> str:
+    """
+    Load a device onto a track by searching for it by name (with fuzzy matching).
+
+    Parameters:
+    - track_index: Index of the track to load the device onto
+    - device_name: Name of the device to load (e.g., "compressor", "EQ Eight", "glue compressor")
+    - category_name: Category to search in (audio_effects, midi_effects, instruments, drums, sounds)
+
+    This is the preferred way to load devices as it uses fuzzy matching to find the closest match.
+    Examples:
+    - "compressor" might match "Compressor"
+    - "glue compressor" will match "Glue Compressor" (not just "Compressor")
+    - "EQ" might match "EQ Eight" or "EQ Three"
+    - "eq eight" will specifically match "EQ Eight"
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("load_device_by_name", {
+            "track_index": track_index,
+            "device_name": device_name,
+            "category_name": category_name
+        })
+
+        if result.get("loaded"):
+            return f"Loaded '{result['device_name']}' on track {track_index} (confidence: {result['confidence']:.2f})"
+        else:
+            error = result.get("error", "Unknown error")
+            top_matches = result.get("top_matches", [])
+            if top_matches:
+                matches_str = "\n".join([f"  - {m['name']} (confidence: {m['confidence']:.2f})" for m in top_matches])
+                return f"Failed to load device: {error}\nDid you mean:\n{matches_str}"
+            else:
+                return f"Failed to load device: {error}"
+    except Exception as e:
+        logger.error(f"Error loading device by name: {str(e)}")
+        return f"Error loading device by name: {str(e)}"
+
 
 # Main execution
 def main():

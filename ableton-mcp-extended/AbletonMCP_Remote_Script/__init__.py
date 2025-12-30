@@ -7,6 +7,7 @@ import json
 import threading
 import time
 import traceback
+import difflib
 
 # Change queue import for Python 2
 try:
@@ -225,13 +226,19 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
+            elif command_type == "get_device_parameters":
+                track_index = params.get("track_index", 0)
+                device_index = params.get("device_index", 0)
+                response["result"] = self._get_device_parameters(track_index, device_index)
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "create_audio_track", "delete_track", "duplicate_track",
                                  "set_track_name", "set_track_volume", "set_track_pan",
                                  "arm_track", "mute_track", "solo_track", "set_track_color",
                                  "create_clip", "add_notes_to_clip", "set_clip_name",
                                  "set_tempo", "fire_clip", "stop_clip",
-                                 "start_playback", "stop_playback", "load_browser_item"]:
+                                 "start_playback", "stop_playback", "load_browser_item",
+                                 "get_all_browser_items", "fuzzy_search_browser", "load_device_by_name",
+                                 "set_device_parameter"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -317,7 +324,27 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             item_uri = params.get("item_uri", "")
                             result = self._load_browser_item(track_index, item_uri)
-                        
+                        elif command_type == "get_all_browser_items":
+                            category_name = params.get("category_name", "audio_effects")
+                            max_depth = params.get("max_depth", 10)
+                            result = self._get_all_browser_items(category_name, max_depth)
+                        elif command_type == "fuzzy_search_browser":
+                            device_name = params.get("device_name", "")
+                            category_name = params.get("category_name", "audio_effects")
+                            threshold = params.get("threshold", 0.6)
+                            result = self._fuzzy_search_browser(device_name, category_name, threshold)
+                        elif command_type == "load_device_by_name":
+                            track_index = params.get("track_index", 0)
+                            device_name = params.get("device_name", "")
+                            category_name = params.get("category_name", "audio_effects")
+                            result = self._load_device_by_name(track_index, device_name, category_name)
+                        elif command_type == "set_device_parameter":
+                            track_index = params.get("track_index", 0)
+                            device_index = params.get("device_index", 0)
+                            parameter_name = params.get("parameter_name", "")
+                            value = params.get("value", 0.0)
+                            result = self._set_device_parameter(track_index, device_index, parameter_name, value)
+
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
                     except Exception as e:
@@ -377,12 +404,21 @@ class AbletonMCP(ControlSurface):
     def _get_session_info(self):
         """Get information about the current session"""
         try:
+            # Build list of all tracks with index and name
+            tracks = []
+            for idx, track in enumerate(self._song.tracks):
+                tracks.append({
+                    "index": idx,
+                    "name": track.name
+                })
+
             result = {
                 "tempo": self._song.tempo,
                 "signature_numerator": self._song.signature_numerator,
                 "signature_denominator": self._song.signature_denominator,
                 "track_count": len(self._song.tracks),
                 "return_track_count": len(self._song.return_tracks),
+                "tracks": tracks,
                 "master_track": {
                     "name": "Master",
                     "volume": self._song.master_track.mixer_device.volume.value,
@@ -448,7 +484,87 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error getting track info: " + str(e))
             raise
-    
+
+    def _get_device_parameters(self, track_index, device_index):
+        """Get all parameters for a device on a track"""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            if device_index < 0 or device_index >= len(track.devices):
+                raise IndexError("Device index out of range")
+
+            device = track.devices[device_index]
+
+            # Get all parameters
+            parameters = []
+            for param_index, param in enumerate(device.parameters):
+                parameters.append({
+                    "index": param_index,
+                    "name": param.name,
+                    "value": param.value,
+                    "min": param.min,
+                    "max": param.max,
+                    "is_enabled": param.is_enabled,
+                    "value_string": param.str_for_value(param.value)
+                })
+
+            result = {
+                "track_index": track_index,
+                "device_index": device_index,
+                "device_name": device.name,
+                "parameters": parameters
+            }
+            return result
+        except Exception as e:
+            self.log_message("Error getting device parameters: " + str(e))
+            raise
+
+    def _set_device_parameter(self, track_index, device_index, parameter_name, value):
+        """Set a parameter value on a device"""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            if device_index < 0 or device_index >= len(track.devices):
+                raise IndexError("Device index out of range")
+
+            device = track.devices[device_index]
+
+            # Find parameter by name (case-insensitive)
+            param_found = None
+            for param in device.parameters:
+                if param.name.lower() == parameter_name.lower():
+                    param_found = param
+                    break
+
+            if not param_found:
+                raise ValueError(f"Parameter '{parameter_name}' not found on device '{device.name}'")
+
+            # Clamp value to valid range
+            clamped_value = max(param_found.min, min(param_found.max, value))
+
+            # Set the value
+            param_found.value = clamped_value
+
+            result = {
+                "track_index": track_index,
+                "device_index": device_index,
+                "device_name": device.name,
+                "parameter_name": param_found.name,
+                "old_value": param_found.value,
+                "new_value": clamped_value,
+                "value_string": param_found.str_for_value(clamped_value)
+            }
+            return result
+        except Exception as e:
+            self.log_message("Error setting device parameter: " + str(e))
+            raise
+
     def _create_midi_track(self, index):
         """Create a new MIDI track at the specified index"""
         try:
@@ -995,7 +1111,175 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error finding browser item by URI: {0}".format(str(e)))
             return None
-    
+
+    def _get_all_browser_items(self, category_name, max_depth=10):
+        """Get all loadable browser items from a category (audio_effects, midi_effects, instruments, drums, sounds)"""
+        try:
+            app = self.application()
+
+            # Get the category root
+            category_map = {
+                "audio_effects": app.browser.audio_effects,
+                "midi_effects": app.browser.midi_effects,
+                "instruments": app.browser.instruments,
+                "drums": app.browser.drums,
+                "sounds": app.browser.sounds
+            }
+
+            category = category_map.get(category_name.lower())
+            if not category:
+                raise ValueError("Invalid category: {0}. Must be one of: audio_effects, midi_effects, instruments, drums, sounds".format(category_name))
+
+            # Recursively collect all loadable items
+            items = []
+            self._collect_browser_items(category, items, max_depth, 0)
+
+            return {
+                "category": category_name,
+                "count": len(items),
+                "items": items
+            }
+        except Exception as e:
+            self.log_message("Error getting browser items: {0}".format(str(e)))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _collect_browser_items(self, browser_item, items, max_depth, current_depth):
+        """Recursively collect all loadable items from a browser item"""
+        try:
+            if current_depth >= max_depth:
+                return
+
+            # If this item is loadable and is a device, add it
+            if hasattr(browser_item, 'is_loadable') and browser_item.is_loadable and hasattr(browser_item, 'is_device') and browser_item.is_device:
+                items.append({
+                    "name": browser_item.name,
+                    "uri": browser_item.uri
+                })
+
+            # Recursively check children
+            if hasattr(browser_item, 'children') and browser_item.children:
+                for child in browser_item.children:
+                    self._collect_browser_items(child, items, max_depth, current_depth + 1)
+        except Exception as e:
+            self.log_message("Error collecting browser items: {0}".format(str(e)))
+
+    def _fuzzy_search_browser(self, device_name, category_name, threshold=0.6):
+        """Search for a device in the browser using fuzzy matching"""
+        try:
+            # Get all items from the category
+            result = self._get_all_browser_items(category_name)
+            items = result.get("items", [])
+
+            if not items:
+                return {
+                    "found": False,
+                    "message": "No items found in category {0}".format(category_name)
+                }
+
+            # Use fuzzy matching to find the best match
+            best_match = None
+            best_ratio = 0.0
+
+            device_name_lower = device_name.lower()
+
+            for item in items:
+                item_name_lower = item["name"].lower()
+
+                # Calculate similarity ratio
+                ratio = difflib.SequenceMatcher(None, device_name_lower, item_name_lower).ratio()
+
+                # Also check if the search term is a substring
+                if device_name_lower in item_name_lower:
+                    ratio = max(ratio, 0.8)  # Boost score for substring matches
+
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_match = item
+
+            # Check if we have a good enough match
+            if best_match and best_ratio >= threshold:
+                return {
+                    "found": True,
+                    "match": best_match,
+                    "confidence": best_ratio,
+                    "searched_count": len(items)
+                }
+            else:
+                # Return top 5 matches for debugging
+                all_matches = []
+                for item in items:
+                    item_name_lower = item["name"].lower()
+                    ratio = difflib.SequenceMatcher(None, device_name_lower, item_name_lower).ratio()
+                    if device_name_lower in item_name_lower:
+                        ratio = max(ratio, 0.8)
+                    all_matches.append((item, ratio))
+
+                all_matches.sort(key=lambda x: x[1], reverse=True)
+                top_matches = [{"name": m[0]["name"], "confidence": m[1]} for m in all_matches[:5]]
+
+                return {
+                    "found": False,
+                    "message": "No match found with confidence >= {0}".format(threshold),
+                    "best_confidence": best_ratio,
+                    "top_matches": top_matches,
+                    "searched_count": len(items)
+                }
+        except Exception as e:
+            self.log_message("Error in fuzzy search: {0}".format(str(e)))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _load_device_by_name(self, track_index, device_name, category_name):
+        """Load a device onto a track by searching for it by name"""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            # Search for the device
+            search_result = self._fuzzy_search_browser(device_name, category_name)
+
+            if not search_result.get("found"):
+                return {
+                    "loaded": False,
+                    "error": search_result.get("message", "Device not found"),
+                    "top_matches": search_result.get("top_matches", [])
+                }
+
+            # Get the matched item
+            matched_item = search_result["match"]
+            uri = matched_item["uri"]
+
+            # Load the device using the URI
+            track = self._song.tracks[track_index]
+            app = self.application()
+
+            # Find the browser item by URI
+            item = self._find_browser_item_by_uri(app.browser, uri)
+
+            if not item:
+                raise ValueError("Browser item with URI '{0}' not found".format(uri))
+
+            # Select the track
+            self._song.view.selected_track = track
+
+            # Load the item
+            app.browser.load_item(item)
+
+            return {
+                "loaded": True,
+                "device_name": matched_item["name"],
+                "searched_name": device_name,
+                "confidence": search_result["confidence"],
+                "track_name": track.name,
+                "track_index": track_index,
+                "uri": uri
+            }
+        except Exception as e:
+            self.log_message("Error loading device by name: {0}".format(str(e)))
+            self.log_message(traceback.format_exc())
+            raise
+
     # Helper methods
     
     def _get_device_type(self, device):
