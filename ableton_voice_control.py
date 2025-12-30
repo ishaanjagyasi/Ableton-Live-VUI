@@ -3,7 +3,7 @@ import asyncio
 import json
 import websockets
 from dotenv import load_dotenv
-from groq import Groq
+from openai import AsyncOpenAI
 import pyaudio
 import numpy as np
 from mcp import ClientSession, StdioServerParameters
@@ -16,7 +16,10 @@ ACTIVATION_WORD = "ableton"
 SILENCE_THRESHOLD = 500
 SILENCE_DURATION = 2.0
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# LLM Model - can be overridden in .env file
+LLM_MODEL = os.getenv("LLM_MODEL", "xiaomi/mimo-v2-flash:free")
 
 # Audio settings
 RATE = 16000
@@ -26,7 +29,11 @@ FORMAT = pyaudio.paInt16
 
 class AbletonVoiceControl:
     def __init__(self):
-        self.groq_client = Groq(api_key=GROQ_API_KEY)
+        # Use OpenRouter with OpenAI-compatible API
+        self.llm_client = AsyncOpenAI(
+            api_key=OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1"
+        )
         self.audio = pyaudio.PyAudio()
         self.is_listening = False
         self.is_activated = False
@@ -71,17 +78,17 @@ class AbletonVoiceControl:
             await self.stdio_context.__aexit__(None, None, None)
 
     async def process_command(self, command):
-        """Process command with Groq and execute via MCP"""
+        """Process voice command with OpenRouter and execute via MCP (natural multi-turn loop)."""
         if not command:
             return
 
-        print(f"Processing: {command}")
+        print(f"\n🎤 Processing: {command}")
 
         try:
-            # Convert MCP tools to Groq format
-            groq_tools = []
+            # Convert MCP tools to OpenAI format
+            openai_tools = []
             for tool in self.available_tools:
-                groq_tools.append({
+                openai_tools.append({
                     "type": "function",
                     "function": {
                         "name": tool.name,
@@ -93,61 +100,131 @@ class AbletonVoiceControl:
                     }
                 })
 
-            # Run Groq in executor to avoid blocking
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[
-                        {"role": "system", "content": """You are an Ableton Live controller. Execute user commands using ONLY the available tools.
+            # System prompt for Ableton control - optimized for speed
+            system_prompt = """You are an Ableton Live controller. Execute user commands efficiently.
 
-CRITICAL RULES:
-1. When user says "audio track" → use create_audio_track (NOT create_midi_track)
-2. When user says "MIDI track" → use create_midi_track (NOT create_audio_track)
-3. When creating multiple items, call the function multiple times
-4. If a requested action has no matching tool, do NOT call any tools
-5. Track indices are 0-based integers
-6. ALWAYS use the exact tool name that matches the user's request
+SPEED OPTIMIZATION - CRITICAL:
+- Call MULTIPLE tools in a SINGLE response whenever possible
+- If you need to add EQ to 3 tracks, call all 3 add_device tools at once
+- Minimize round trips - batch related operations together
+- Only use get_session_info() when you truly need track indices
 
-Parameter types:
-- index: integer (e.g., -1, 0, 1, 2)
-- volume: float 0.0-1.0
-- pan: float -1.0 to 1.0
-- armed/muted/soloed: boolean"""},
-                        {"role": "user", "content": command}
-                    ],
-                    tools=groq_tools,
-                    tool_choice="auto",
-                    max_tokens=1000
-                )
+TRACK OPERATIONS:
+- When user mentions tracks by name, FIRST call get_session_info() to get indices
+- Then perform ALL operations on those tracks in the SAME response
+
+DEVICE OPERATIONS:
+- To modify existing devices: get_track_info() → get_device_parameters() → set_device_parameter()
+- Call these in sequence only when needed
+
+RULES:
+- NEVER guess track indices
+- NEVER rename tracks unless explicitly asked
+- NEVER load a new device if one already exists - control the existing one
+- Be decisive - complete the task in as few turns as possible"""
+
+            # Initial conversation messages
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": command}
+            ]
+
+            # Call OpenRouter
+            print(f"🤖 Asking LLM ({LLM_MODEL})...")
+            response = await self.llm_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                tools=openai_tools,
+                tool_choice="auto",
+                max_tokens=2000
             )
 
-            if response.choices[0].message.tool_calls:
-                for tool_call in response.choices[0].message.tool_calls:
-                    func_name = tool_call.function.name
-                    func_args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+            # Multi-turn execution loop - continues until LLM indicates completion
+            turn = 1
 
-                    print(f"Executing: {func_name} with {func_args}")
+            while True:  # Trust the LLM to know when it's done
+                print(f"\n{'='*60}")
+                print(f"TURN {turn}")
+                print(f"{'='*60}")
 
-                    # Call the MCP tool
-                    result = await self.mcp_session.call_tool(func_name, arguments=func_args)
-                    output = result.content[0].text if result.content else "Done"
-                    print(f"Result: {output}")
-            else:
-                print("⚠️  Cannot perform this action - function not available in Ableton MCP server")
-                print("    Available: create tracks, rename tracks, create/fire clips, set tempo, start/stop playback")
+                # Get LLM response (first turn uses initial response)
+                if turn == 1:
+                    llm_response = response
+                else:
+                    # Ask LLM to continue
+                    messages.append({
+                        "role": "user",
+                        "content": f"Continue with the next steps to complete: '{command}'. Call any remaining tools needed, or respond with text if complete."
+                    })
+
+                    llm_response = await self.llm_client.chat.completions.create(
+                        model=LLM_MODEL,
+                        messages=messages,
+                        tools=openai_tools,
+                        tool_choice="auto",
+                        max_tokens=2000
+                    )
+
+                # Check if there are tool calls
+                if llm_response.choices[0].message.tool_calls:
+                    tool_calls = llm_response.choices[0].message.tool_calls
+                    print(f"🔧 Executing {len(tool_calls)} tool(s) in parallel...")
+
+                    # Add assistant message to history
+                    messages.append(llm_response.choices[0].message)
+
+                    # Execute all tool calls in PARALLEL for speed
+                    async def execute_tool(tool_call):
+                        func_name = tool_call.function.name
+                        func_args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+                        print(f"  → {func_name}({func_args})")
+
+                        try:
+                            result = await self.mcp_session.call_tool(func_name, arguments=func_args)
+                            if result.content:
+                                result_text = result.content[0].text
+                                print(f"    ✅ {result_text[:100]}..." if len(result_text) > 100 else f"    ✅ {result_text}")
+                            else:
+                                result_text = "Done"
+                                print(f"    ✅ Done")
+                        except Exception as tool_error:
+                            result_text = f"Error: {tool_error}"
+                            print(f"    ❌ {result_text}")
+
+                        return {"tool_call_id": tool_call.id, "content": result_text}
+
+                    # Run all tools in parallel
+                    results = await asyncio.gather(*[execute_tool(tc) for tc in tool_calls])
+
+                    # Add all tool results to conversation
+                    for result in results:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": result["tool_call_id"],
+                            "content": result["content"]
+                        })
+
+                    turn += 1
+
+                else:
+                    # No more tool calls - LLM says task is complete
+                    final_response = llm_response.choices[0].message.content
+                    if final_response:
+                        print(f"\n💬 LLM: {final_response}")
+                    print("\n✅ Command completed!\n")
+                    break
+
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"❌ Error processing command: {e}")
             import traceback
             traceback.print_exc()
 
     async def run(self):
-        """Main run loop"""
+        """Main run loop - voice capture and command processing."""
         # Connect to MCP server first
         await self.connect_mcp()
 
-        print(f"Starting voice control. Say '{ACTIVATION_WORD}' to activate...")
+        print(f"\n🎙️  Voice control ready! Say '{ACTIVATION_WORD}' to activate...\n")
 
         url = f"wss://api.deepgram.com/v1/listen?model=nova-3&encoding=linear16&sample_rate={RATE}&channels={CHANNELS}&smart_format=true&interim_results=true&endpointing=300"
 
@@ -155,7 +232,7 @@ Parameter types:
             url,
             additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
         ) as ws:
-            print("Connected to Deepgram!")
+            print("✅ Connected to Deepgram")
 
             # Give connection a moment to stabilize
             await asyncio.sleep(0.1)
@@ -168,33 +245,32 @@ Parameter types:
                 frames_per_buffer=CHUNK
             )
 
-            print(f"Audio stream opened. Testing microphone...")
+            print("✅ Microphone ready")
             # Test read to ensure mic is working
             try:
                 test_data = stream.read(CHUNK, exception_on_overflow=False)
-                print(f"Microphone working! Read {len(test_data)} bytes")
+                print(f"✅ Audio test passed ({len(test_data)} bytes)\n")
             except Exception as e:
-                print(f"Microphone test failed: {e}")
+                print(f"❌ Microphone test failed: {e}")
                 return
 
             silence_chunks_needed = int(SILENCE_DURATION * RATE / CHUNK)
             self.is_listening = True
 
             async def send_audio():
-                """Send audio to Deepgram"""
+                """Send audio to Deepgram."""
                 loop = asyncio.get_event_loop()
                 try:
-                    print("Starting audio stream...")
                     while self.is_listening:
                         # Run blocking read in executor
                         try:
                             data = await loop.run_in_executor(None, stream.read, CHUNK, False)
                             await ws.send(data)
                         except Exception as read_error:
-                            print(f"Audio read error: {read_error}")
                             await asyncio.sleep(0.01)
                             continue
 
+                        # Silence detection during command recording
                         if self.is_recording_command:
                             audio_array = np.frombuffer(data, dtype=np.int16)
                             volume = np.abs(audio_array).mean()
@@ -204,8 +280,9 @@ Parameter types:
                             else:
                                 self.silent_chunks = 0
 
+                            # End command on silence
                             if self.silent_chunks >= silence_chunks_needed:
-                                print("Silence detected")
+                                print("🔇 Silence detected, processing command...")
                                 self.is_recording_command = False
                                 self.is_activated = False
 
@@ -216,12 +293,12 @@ Parameter types:
 
                                 self.accumulated_transcript = ""
                                 self.silent_chunks = 0
-                                print(f"Listening for '{ACTIVATION_WORD}'...")
+                                print(f"\n🎙️  Listening for '{ACTIVATION_WORD}'...\n")
                 except Exception as e:
-                    print(f"Send error: {e}")
+                    print(f"❌ Audio send error: {e}")
 
             async def receive_transcripts():
-                """Receive transcripts from Deepgram"""
+                """Receive transcripts from Deepgram."""
                 try:
                     async for message in ws:
                         result = json.loads(message)
@@ -231,23 +308,26 @@ Parameter types:
                             is_final = result.get("is_final", False)
 
                             if transcript and is_final:
+                                # Wake word detection
                                 if not self.is_activated and ACTIVATION_WORD.lower() in transcript.lower():
-                                    print(f"Activation: {transcript}")
-                                    print("Listening for command...")
+                                    print(f"✨ Activated! Say your command...")
                                     self.is_activated = True
                                     self.is_recording_command = True
                                     self.accumulated_transcript = ""
                                     self.silent_chunks = 0
+
+                                # Command recording
                                 elif self.is_activated and self.is_recording_command:
                                     self.accumulated_transcript += " " + transcript
-                                    print(f"Transcript: {transcript}")
+                                    print(f"📝 {transcript}")
                 except Exception as e:
-                    print(f"Receive error: {e}")
+                    print(f"❌ Transcript receive error: {e}")
 
+            # Run both tasks concurrently
             try:
                 await asyncio.gather(send_audio(), receive_transcripts())
             except KeyboardInterrupt:
-                print("\nStopping...")
+                print("\n👋 Stopping voice control...")
             finally:
                 self.is_listening = False
                 stream.stop_stream()

@@ -50,3 +50,7 @@ secrets.json
 # OS
 .DS_Store
 Thumbs.db
+
+# External projects
+producer-pal/
+Production Pal/
