@@ -141,6 +141,8 @@ RULES:
 
             # Multi-turn execution loop - continues until LLM indicates completion
             turn = 1
+            had_errors = False
+            tools_executed = 0
 
             while True:  # Trust the LLM to know when it's done
                 print(f"\n{'='*60}")
@@ -175,20 +177,28 @@ RULES:
 
                     # Execute all tool calls in PARALLEL for speed
                     async def execute_tool(tool_call):
+                        nonlocal had_errors, tools_executed
                         func_name = tool_call.function.name
                         func_args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
                         print(f"  → {func_name}({func_args})")
+                        tools_executed += 1
 
                         try:
                             result = await self.mcp_session.call_tool(func_name, arguments=func_args)
                             if result.content:
                                 result_text = result.content[0].text
-                                print(f"    ✅ {result_text[:100]}..." if len(result_text) > 100 else f"    ✅ {result_text}")
+                                # Check if result contains error indicators
+                                if "error" in result_text.lower() or "failed" in result_text.lower():
+                                    had_errors = True
+                                    print(f"    ⚠️ {result_text[:100]}..." if len(result_text) > 100 else f"    ⚠️ {result_text}")
+                                else:
+                                    print(f"    ✅ {result_text[:100]}..." if len(result_text) > 100 else f"    ✅ {result_text}")
                             else:
                                 result_text = "Done"
                                 print(f"    ✅ Done")
                         except Exception as tool_error:
                             result_text = f"Error: {tool_error}"
+                            had_errors = True
                             print(f"    ❌ {result_text}")
 
                         return {"tool_call_id": tool_call.id, "content": result_text}
@@ -211,11 +221,25 @@ RULES:
                     final_response = llm_response.choices[0].message.content
                     if final_response:
                         print(f"\n💬 LLM: {final_response}")
-                    print("\n✅ Command completed!\n")
+
+                    # Print summary
+                    print(f"\n{'='*60}")
+                    print(f"📋 COMMAND: \"{command}\"")
+                    if tools_executed == 0:
+                        print(f"❌ RESULT: Task could not be completed (no tools executed)")
+                    elif had_errors:
+                        print(f"⚠️  RESULT: Task completed with errors ({tools_executed} tools executed)")
+                    else:
+                        print(f"✅ RESULT: Task completed successfully ({tools_executed} tools executed)")
+                    print(f"{'='*60}\n")
                     break
 
         except Exception as e:
-            print(f"❌ Error processing command: {e}")
+            # Print failure summary
+            print(f"\n{'='*60}")
+            print(f"📋 COMMAND: \"{command}\"")
+            print(f"❌ RESULT: Task failed - {e}")
+            print(f"{'='*60}\n")
             import traceback
             traceback.print_exc()
 

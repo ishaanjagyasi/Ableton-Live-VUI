@@ -4,8 +4,7 @@ import socket
 import json
 import logging
 from dataclasses import dataclass
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List, Union
+from typing import Dict, Any, List, Union
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -105,7 +104,8 @@ class AbletonConnection:
             "create_midi_track", "create_audio_track", "set_track_name",
             "create_clip", "add_notes_to_clip", "set_clip_name",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
-            "start_playback", "stop_playback", "load_instrument_or_effect"
+            "start_playback", "stop_playback", "load_instrument_or_effect",
+            "set_track_output_routing", "set_track_input_routing", "set_track_monitoring"
         ]
         
         try:
@@ -161,34 +161,8 @@ class AbletonConnection:
             self.sock = None
             raise Exception(f"Communication error with Ableton: {str(e)}")
 
-@asynccontextmanager
-async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
-    """Manage server startup and shutdown lifecycle"""
-    try:
-        logger.info("AbletonMCP server starting up")
-        
-        try:
-            ableton = get_ableton_connection()
-            logger.info("Successfully connected to Ableton on startup")
-        except Exception as e:
-            logger.warning(f"Could not connect to Ableton on startup: {str(e)}")
-            logger.warning("Make sure the Ableton Remote Script is running")
-        
-        yield {}
-    finally:
-        global _ableton_connection
-        if _ableton_connection:
-            logger.info("Disconnecting from Ableton on shutdown")
-            _ableton_connection.disconnect()
-            _ableton_connection = None
-        logger.info("AbletonMCP server shut down")
-
-# Create the MCP server with lifespan support
-mcp = FastMCP(
-    "AbletonMCP",
-    description="Ableton Live integration through the Model Context Protocol",
-    lifespan=server_lifespan
-)
+# Create the MCP server
+mcp = FastMCP("AbletonMCP")
 
 # Global connection for resources
 _ableton_connection = None
@@ -516,7 +490,7 @@ def set_track_color(ctx: Context, track_index: int, color_index: int) -> str:
 def set_track_name(ctx: Context, track_index: int, name: str) -> str:
     """
     Set the name of a track.
-    
+
     Parameters:
     - track_index: The index of the track to rename
     - name: The new name for the track
@@ -528,6 +502,307 @@ def set_track_name(ctx: Context, track_index: int, name: str) -> str:
     except Exception as e:
         logger.error(f"Error setting track name: {str(e)}")
         return f"Error setting track name: {str(e)}"
+
+
+@mcp.tool()
+def get_track_routing_options(ctx: Context, track_index: int) -> str:
+    """
+    Get available input and output routing options for a track.
+
+    Parameters:
+    - track_index: The index of the track to get routing options for
+
+    Returns information about:
+    - Current and available output routing types and channels
+    - Current and available input routing types and channels
+    - Current monitoring state (In/Auto/Off)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_track_routing_options", {"track_index": track_index})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting track routing options: {str(e)}")
+        return f"Error getting track routing options: {str(e)}"
+
+
+@mcp.tool()
+def set_track_output_routing(ctx: Context, track_index: int, routing_type_name: str, channel_name: str = None) -> str:
+    """
+    Set the output routing of a track.
+
+    Parameters:
+    - track_index: The index of the track to route
+    - routing_type_name: The name of the routing destination (e.g., "Master", track name, "Sends Only")
+    - channel_name: Optional channel name for the routing (e.g., "Track In")
+
+    Use get_track_routing_options to see available routing types for a track.
+    To route a track to another track (for grouping), use the target track's name as routing_type_name.
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {
+            "track_index": track_index,
+            "routing_type_name": routing_type_name
+        }
+        if channel_name:
+            params["channel_name"] = channel_name
+        result = ableton.send_command("set_track_output_routing", params)
+        return f"Set track {track_index} output routing to: {result.get('output_routing_type', routing_type_name)}"
+    except Exception as e:
+        logger.error(f"Error setting track output routing: {str(e)}")
+        return f"Error setting track output routing: {str(e)}"
+
+
+@mcp.tool()
+def set_track_input_routing(ctx: Context, track_index: int, routing_type_name: str, channel_name: str = None) -> str:
+    """
+    Set the input routing of a track.
+
+    Parameters:
+    - track_index: The index of the track to configure
+    - routing_type_name: The name of the input source (e.g., "No Input", "Ext. In", track name)
+    - channel_name: Optional channel name for the input
+
+    Use get_track_routing_options to see available input routing types for a track.
+    Use "No Input" for group/bus tracks that only receive audio from other tracks.
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {
+            "track_index": track_index,
+            "routing_type_name": routing_type_name
+        }
+        if channel_name:
+            params["channel_name"] = channel_name
+        result = ableton.send_command("set_track_input_routing", params)
+        return f"Set track {track_index} input routing to: {result.get('input_routing_type', routing_type_name)}"
+    except Exception as e:
+        logger.error(f"Error setting track input routing: {str(e)}")
+        return f"Error setting track input routing: {str(e)}"
+
+
+@mcp.tool()
+def set_track_monitoring(ctx: Context, track_index: int, monitoring_state: int) -> str:
+    """
+    Set the monitoring state of a track.
+
+    Parameters:
+    - track_index: The index of the track to configure
+    - monitoring_state: 0 = In (always monitor), 1 = Auto (monitor when armed), 2 = Off (never monitor)
+
+    For group/bus tracks that receive audio from other tracks, use monitoring_state=0 (In) to hear the audio.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_track_monitoring", {
+            "track_index": track_index,
+            "monitoring_state": monitoring_state
+        })
+        state_name = result.get('monitoring_state_name', ['In', 'Auto', 'Off'][monitoring_state])
+        return f"Set track {track_index} monitoring to: {state_name}"
+    except Exception as e:
+        logger.error(f"Error setting track monitoring: {str(e)}")
+        return f"Error setting track monitoring: {str(e)}"
+
+
+@mcp.tool()
+def create_track_group(ctx: Context, group_name: str, track_indices: List[int]) -> str:
+    """
+    Create a group from existing tracks using routing (classic bus/group technique).
+
+    This creates an audio track as a "group bus" and routes all specified tracks to it.
+    Since Ableton's API doesn't support native group tracks or track reordering,
+    this uses the classic routing method to achieve the same audio result.
+
+    Parameters:
+    - group_name: Name for the group track (e.g., "Drums Bus", "Vocals Group")
+    - track_indices: List of track indices to route to the group
+
+    The function will:
+    1. Create an audio track named with group_name
+    2. Set the group track's input to "No Input"
+    3. Set the group track's monitoring to "In"
+    4. Route all specified tracks' outputs to the group track
+
+    Note: Tracks cannot be physically moved adjacent to the group via API,
+    but they will all be routed to the group track for audio summing.
+
+    For creating NEW tracks that are grouped together, use create_grouped_tracks instead.
+    """
+    try:
+        ableton = get_ableton_connection()
+
+        # Step 1: Create the group audio track at the end
+        create_result = ableton.send_command("create_audio_track", {"index": -1})
+        group_track_index = create_result.get("index")
+
+        # Step 2: Name the group track
+        ableton.send_command("set_track_name", {
+            "track_index": group_track_index,
+            "name": group_name
+        })
+
+        # Step 3: Set input to "No Input"
+        try:
+            ableton.send_command("set_track_input_routing", {
+                "track_index": group_track_index,
+                "routing_type_name": "No Input"
+            })
+        except Exception as e:
+            logger.warning(f"Could not set input to 'No Input': {str(e)}")
+
+        # Step 4: Set monitoring to "In" (state 0)
+        ableton.send_command("set_track_monitoring", {
+            "track_index": group_track_index,
+            "monitoring_state": 0
+        })
+
+        # Step 5: Route all tracks to the group
+        routed_tracks = []
+        failed_tracks = []
+
+        for track_idx in track_indices:
+            try:
+                ableton.send_command("set_track_output_routing", {
+                    "track_index": track_idx,
+                    "routing_type_name": group_name
+                })
+                routed_tracks.append(track_idx)
+            except Exception as e:
+                logger.warning(f"Failed to route track {track_idx}: {str(e)}")
+                failed_tracks.append(track_idx)
+
+        # Build result message
+        result_msg = f"Created group '{group_name}' at track index {group_track_index}. "
+        result_msg += f"Routed {len(routed_tracks)} tracks to the group."
+
+        if failed_tracks:
+            result_msg += f" Failed to route tracks: {failed_tracks}"
+
+        return result_msg
+    except Exception as e:
+        logger.error(f"Error creating track group: {str(e)}")
+        return f"Error creating track group: {str(e)}"
+
+
+@mcp.tool()
+def create_grouped_tracks(
+    ctx: Context,
+    group_name: str,
+    track_count: int,
+    track_type: str = "midi",
+    track_names: List[str] = None
+) -> str:
+    """
+    Create new tracks and group them together in one operation.
+
+    This creates the group track FIRST, then creates the member tracks sequentially,
+    so they appear in order: [Group Track] → [Track 1] → [Track 2] → ...
+
+    Parameters:
+    - group_name: Name for the group track (e.g., "Drums", "Synths", "Vocals")
+    - track_count: Number of tracks to create within the group
+    - track_type: Type of tracks to create - "midi" or "audio" (default: "midi")
+    - track_names: Optional list of names for each track (e.g., ["Kick", "Snare", "HiHat"])
+                   If not provided, tracks are named "{group_name} 1", "{group_name} 2", etc.
+
+    The function will:
+    1. Create the group audio track first (with "No Input" and monitoring "In")
+    2. Create each member track sequentially after the group
+    3. Name each track appropriately
+    4. Route all member tracks to the group track
+
+    Example:
+        create_grouped_tracks("Drums", 3, "midi", ["Kick", "Snare", "HiHat"])
+
+        Results in:
+        - Drums (group track, audio)
+        - Kick (midi, routed to Drums)
+        - Snare (midi, routed to Drums)
+        - HiHat (midi, routed to Drums)
+    """
+    try:
+        ableton = get_ableton_connection()
+
+        # Validate track_type
+        track_type = track_type.lower()
+        if track_type not in ["midi", "audio"]:
+            return f"Error: track_type must be 'midi' or 'audio', got '{track_type}'"
+
+        # Step 1: Create the group audio track at the end
+        create_result = ableton.send_command("create_audio_track", {"index": -1})
+        group_track_index = create_result.get("index")
+
+        # Step 2: Name the group track
+        ableton.send_command("set_track_name", {
+            "track_index": group_track_index,
+            "name": group_name
+        })
+
+        # Step 3: Set input to "No Input"
+        try:
+            ableton.send_command("set_track_input_routing", {
+                "track_index": group_track_index,
+                "routing_type_name": "No Input"
+            })
+        except Exception as e:
+            logger.warning(f"Could not set input to 'No Input': {str(e)}")
+
+        # Step 4: Set monitoring to "In" (state 0)
+        ableton.send_command("set_track_monitoring", {
+            "track_index": group_track_index,
+            "monitoring_state": 0
+        })
+
+        # Step 5: Create member tracks sequentially (they'll appear after the group)
+        created_tracks = []
+
+        for i in range(track_count):
+            # Create the track at the end (will be after group and previous tracks)
+            if track_type == "midi":
+                track_result = ableton.send_command("create_midi_track", {"index": -1})
+            else:
+                track_result = ableton.send_command("create_audio_track", {"index": -1})
+
+            new_track_index = track_result.get("index")
+
+            # Determine track name
+            if track_names and i < len(track_names):
+                track_name = track_names[i]
+            else:
+                track_name = f"{group_name} {i + 1}"
+
+            # Name the track
+            ableton.send_command("set_track_name", {
+                "track_index": new_track_index,
+                "name": track_name
+            })
+
+            # Route to the group
+            try:
+                ableton.send_command("set_track_output_routing", {
+                    "track_index": new_track_index,
+                    "routing_type_name": group_name
+                })
+            except Exception as e:
+                logger.warning(f"Failed to route track {new_track_index} to group: {str(e)}")
+
+            created_tracks.append({
+                "index": new_track_index,
+                "name": track_name
+            })
+
+        # Build result message
+        track_names_str = ", ".join([t["name"] for t in created_tracks])
+        result_msg = f"Created group '{group_name}' (index {group_track_index}) with {track_count} {track_type} tracks: {track_names_str}. "
+        result_msg += f"All tracks routed to '{group_name}'."
+
+        return result_msg
+    except Exception as e:
+        logger.error(f"Error creating grouped tracks: {str(e)}")
+        return f"Error creating grouped tracks: {str(e)}"
+
 
 @mcp.tool()
 def create_clip(ctx: Context, track_index: int, clip_index: int, length: float = 4.0) -> str:
