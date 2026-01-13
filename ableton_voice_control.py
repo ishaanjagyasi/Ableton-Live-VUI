@@ -42,6 +42,7 @@ class AbletonVoiceControl:
         self.silent_chunks = 0
         self.mcp_session = None
         self.available_tools = []
+        self.openai_tools = []  # Cached OpenAI-format tools
 
     async def connect_mcp(self):
         """Connect to MCP server and load all available tools dynamically"""
@@ -65,7 +66,22 @@ class AbletonVoiceControl:
         tools_result = await self.mcp_session.list_tools()
         self.available_tools = tools_result.tools
 
-        print(f"✅ Connected! Loaded {len(self.available_tools)} tools from MCP server")
+        # Pre-convert tools to OpenAI format ONCE (optimization)
+        self.openai_tools = []
+        for tool in self.available_tools:
+            self.openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or f"Execute {tool.name}",
+                    "parameters": tool.inputSchema if hasattr(tool, 'inputSchema') and tool.inputSchema else {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            })
+
+        print(f"✅ Connected! Loaded {len(self.openai_tools)} tools from MCP server")
         print("Available commands:", ", ".join([tool.name for tool in self.available_tools[:10]]))
         if len(self.available_tools) > 10:
             print(f"  ... and {len(self.available_tools) - 10} more")
@@ -85,20 +101,7 @@ class AbletonVoiceControl:
         print(f"\n🎤 Processing: {command}")
 
         try:
-            # Convert MCP tools to OpenAI format
-            openai_tools = []
-            for tool in self.available_tools:
-                openai_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description or f"Execute {tool.name}",
-                        "parameters": tool.inputSchema if hasattr(tool, 'inputSchema') and tool.inputSchema else {
-                            "type": "object",
-                            "properties": {}
-                        }
-                    }
-                })
+            # Use cached OpenAI-format tools (converted once at startup)
 
             # System prompt for Ableton control - optimized for speed
             system_prompt = """You are an Ableton Live controller. Execute user commands efficiently.
@@ -134,7 +137,7 @@ RULES:
             response = await self.llm_client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=messages,
-                tools=openai_tools,
+                tools=self.openai_tools,
                 tool_choice="auto",
                 max_tokens=2000
             )
@@ -162,7 +165,7 @@ RULES:
                     llm_response = await self.llm_client.chat.completions.create(
                         model=LLM_MODEL,
                         messages=messages,
-                        tools=openai_tools,
+                        tools=self.openai_tools,
                         tool_choice="auto",
                         max_tokens=2000
                     )
