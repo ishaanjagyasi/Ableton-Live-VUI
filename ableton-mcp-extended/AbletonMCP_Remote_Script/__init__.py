@@ -241,6 +241,7 @@ class AbletonMCP(ControlSurface):
                                  "set_device_parameter",
                                  "get_track_routing_options", "set_track_output_routing",
                                  "set_track_input_routing", "set_track_monitoring",
+                                 "set_track_input_channel", "set_track_output_channel",
                                  "get_return_tracks_info", "get_track_sends", "set_track_send",
                                  "create_return_track", "set_return_track_name", "delete_return_track"]:
                 # Use a thread-safe approach with a response queue
@@ -365,6 +366,14 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             monitoring_state = params.get("monitoring_state", 1)
                             result = self._set_track_monitoring(track_index, monitoring_state)
+                        elif command_type == "set_track_input_channel":
+                            track_index = params.get("track_index", 0)
+                            channel_name = params.get("channel_name", "")
+                            result = self._set_track_input_channel(track_index, channel_name)
+                        elif command_type == "set_track_output_channel":
+                            track_index = params.get("track_index", 0)
+                            channel_name = params.get("channel_name", "")
+                            result = self._set_track_output_channel(track_index, channel_name)
                         elif command_type == "get_return_tracks_info":
                             result = self._get_return_tracks_info()
                         elif command_type == "get_track_sends":
@@ -1398,23 +1407,51 @@ class AbletonMCP(ControlSurface):
             self.log_message(traceback.format_exc())
             raise
 
+    def _fuzzy_match_routing(self, search_name, available_items, threshold=0.6):
+        """Fuzzy match a routing type or channel name against available options"""
+        search_lower = search_name.lower().strip()
+
+        # First try exact match
+        for item in available_items:
+            if item.display_name.lower() == search_lower:
+                return item, 1.0
+
+        # Then try contains match
+        for item in available_items:
+            if search_lower in item.display_name.lower() or item.display_name.lower() in search_lower:
+                return item, 0.9
+
+        # Finally try fuzzy match
+        best_match = None
+        best_score = 0.0
+
+        for item in available_items:
+            # Use SequenceMatcher for fuzzy matching
+            score = difflib.SequenceMatcher(None, search_lower, item.display_name.lower()).ratio()
+            if score > best_score:
+                best_score = score
+                best_match = item
+
+        if best_score >= threshold:
+            return best_match, best_score
+
+        return None, 0.0
+
     def _set_track_output_routing(self, track_index, routing_type_name, channel_name=None):
-        """Set the output routing of a track"""
+        """Set the output routing of a track with fuzzy matching support"""
         try:
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
 
             track = self._song.tracks[track_index]
 
-            # Find the routing type by display name
-            routing_type = None
-            for rt in track.available_output_routing_types:
-                if rt.display_name.lower() == routing_type_name.lower():
-                    routing_type = rt
-                    break
+            # Fuzzy match the routing type
+            routing_type, type_score = self._fuzzy_match_routing(
+                routing_type_name,
+                track.available_output_routing_types
+            )
 
             if not routing_type:
-                # List available types in error message
                 available = [rt.display_name for rt in track.available_output_routing_types]
                 raise ValueError("Output routing type '{0}' not found. Available: {1}".format(
                     routing_type_name, ", ".join(available)))
@@ -1422,23 +1459,23 @@ class AbletonMCP(ControlSurface):
             # Set the output routing type
             track.output_routing_type = routing_type
 
-            # If channel is specified, set it too
+            # If channel is specified, fuzzy match and set it too
+            channel_matched = None
             if channel_name:
-                # Need to refresh available channels after changing type
-                channel = None
-                for ch in track.available_output_routing_channels:
-                    if ch.display_name.lower() == channel_name.lower():
-                        channel = ch
-                        break
-
-                if channel:
-                    track.output_routing_channel = channel
+                channel_matched, channel_score = self._fuzzy_match_routing(
+                    channel_name,
+                    track.available_output_routing_channels
+                )
+                if channel_matched:
+                    track.output_routing_channel = channel_matched
 
             return {
                 "track_index": track_index,
                 "track_name": track.name,
                 "output_routing_type": track.output_routing_type.display_name,
-                "output_routing_channel": track.output_routing_channel.display_name if track.output_routing_channel else None
+                "output_routing_channel": track.output_routing_channel.display_name if track.output_routing_channel else None,
+                "type_match_score": type_score,
+                "channel_match_score": channel_score if channel_name and channel_matched else None
             }
         except Exception as e:
             self.log_message("Error setting track output routing: " + str(e))
@@ -1446,22 +1483,20 @@ class AbletonMCP(ControlSurface):
             raise
 
     def _set_track_input_routing(self, track_index, routing_type_name, channel_name=None):
-        """Set the input routing of a track"""
+        """Set the input routing of a track with fuzzy matching support"""
         try:
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
 
             track = self._song.tracks[track_index]
 
-            # Find the routing type by display name
-            routing_type = None
-            for rt in track.available_input_routing_types:
-                if rt.display_name.lower() == routing_type_name.lower():
-                    routing_type = rt
-                    break
+            # Fuzzy match the routing type
+            routing_type, type_score = self._fuzzy_match_routing(
+                routing_type_name,
+                track.available_input_routing_types
+            )
 
             if not routing_type:
-                # List available types in error message
                 available = [rt.display_name for rt in track.available_input_routing_types]
                 raise ValueError("Input routing type '{0}' not found. Available: {1}".format(
                     routing_type_name, ", ".join(available)))
@@ -1469,25 +1504,94 @@ class AbletonMCP(ControlSurface):
             # Set the input routing type
             track.input_routing_type = routing_type
 
-            # If channel is specified, set it too
+            # If channel is specified, fuzzy match and set it too
+            channel_matched = None
             if channel_name:
-                channel = None
-                for ch in track.available_input_routing_channels:
-                    if ch.display_name.lower() == channel_name.lower():
-                        channel = ch
-                        break
-
-                if channel:
-                    track.input_routing_channel = channel
+                channel_matched, channel_score = self._fuzzy_match_routing(
+                    channel_name,
+                    track.available_input_routing_channels
+                )
+                if channel_matched:
+                    track.input_routing_channel = channel_matched
 
             return {
                 "track_index": track_index,
                 "track_name": track.name,
                 "input_routing_type": track.input_routing_type.display_name,
-                "input_routing_channel": track.input_routing_channel.display_name if track.input_routing_channel else None
+                "input_routing_channel": track.input_routing_channel.display_name if track.input_routing_channel else None,
+                "type_match_score": type_score,
+                "channel_match_score": channel_score if channel_name and channel_matched else None
             }
         except Exception as e:
             self.log_message("Error setting track input routing: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _set_track_input_channel(self, track_index, channel_name):
+        """Set only the input channel of a track (without changing the input type)"""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            # Fuzzy match the channel
+            channel, score = self._fuzzy_match_routing(
+                channel_name,
+                track.available_input_routing_channels
+            )
+
+            if not channel:
+                available = [ch.display_name for ch in track.available_input_routing_channels]
+                raise ValueError("Input channel '{0}' not found. Available: {1}".format(
+                    channel_name, ", ".join(available)))
+
+            # Set the channel
+            track.input_routing_channel = channel
+
+            return {
+                "track_index": track_index,
+                "track_name": track.name,
+                "input_routing_type": track.input_routing_type.display_name if track.input_routing_type else None,
+                "input_routing_channel": track.input_routing_channel.display_name,
+                "match_score": score
+            }
+        except Exception as e:
+            self.log_message("Error setting track input channel: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _set_track_output_channel(self, track_index, channel_name):
+        """Set only the output channel of a track (without changing the output type)"""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            # Fuzzy match the channel
+            channel, score = self._fuzzy_match_routing(
+                channel_name,
+                track.available_output_routing_channels
+            )
+
+            if not channel:
+                available = [ch.display_name for ch in track.available_output_routing_channels]
+                raise ValueError("Output channel '{0}' not found. Available: {1}".format(
+                    channel_name, ", ".join(available)))
+
+            # Set the channel
+            track.output_routing_channel = channel
+
+            return {
+                "track_index": track_index,
+                "track_name": track.name,
+                "output_routing_type": track.output_routing_type.display_name if track.output_routing_type else None,
+                "output_routing_channel": track.output_routing_channel.display_name,
+                "match_score": score
+            }
+        except Exception as e:
+            self.log_message("Error setting track output channel: " + str(e))
             self.log_message(traceback.format_exc())
             raise
 

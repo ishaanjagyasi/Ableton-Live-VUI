@@ -106,6 +106,7 @@ class AbletonConnection:
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
             "start_playback", "stop_playback", "load_instrument_or_effect",
             "set_track_output_routing", "set_track_input_routing", "set_track_monitoring",
+            "set_track_input_channel", "set_track_output_channel",
             "set_track_send", "create_return_track", "set_return_track_name", "delete_return_track"
         ]
         
@@ -581,6 +582,64 @@ def set_track_input_routing(ctx: Context, track_index: int, routing_type_name: s
     except Exception as e:
         logger.error(f"Error setting track input routing: {str(e)}")
         return f"Error setting track input routing: {str(e)}"
+
+
+@mcp.tool()
+def set_track_input_channel(ctx: Context, track_index: int, channel_name: str) -> str:
+    """
+    Set only the input channel of a track (without changing the input type).
+
+    Parameters:
+    - track_index: The index of the track to configure
+    - channel_name: The channel name (e.g., "1/2", "3/4", "Pre FX", "Post FX", "Post Mixer")
+                    Supports fuzzy matching - "1" might match "1/2", etc.
+
+    Use this when you want to change just the channel without specifying the input type again.
+    Use get_track_routing_options to see available channels for the current input type.
+
+    Examples:
+    - set_track_input_channel(0, "1/2") - Set track 0's input channel to channels 1/2
+    - set_track_input_channel(0, "stereo") - Fuzzy match to "Stereo" or similar
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_track_input_channel", {
+            "track_index": track_index,
+            "channel_name": channel_name
+        })
+        return f"Set track {track_index} input channel to: {result.get('input_routing_channel', channel_name)}"
+    except Exception as e:
+        logger.error(f"Error setting track input channel: {str(e)}")
+        return f"Error setting track input channel: {str(e)}"
+
+
+@mcp.tool()
+def set_track_output_channel(ctx: Context, track_index: int, channel_name: str) -> str:
+    """
+    Set only the output channel of a track (without changing the output type).
+
+    Parameters:
+    - track_index: The index of the track to configure
+    - channel_name: The channel name (e.g., "Track In", "1/2", "3/4")
+                    Supports fuzzy matching.
+
+    Use this when you want to change just the channel without specifying the output type again.
+    Use get_track_routing_options to see available channels for the current output type.
+
+    Examples:
+    - set_track_output_channel(0, "Track In") - Set track 0's output channel to Track In
+    - set_track_output_channel(0, "1/2") - Set to channels 1/2
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_track_output_channel", {
+            "track_index": track_index,
+            "channel_name": channel_name
+        })
+        return f"Set track {track_index} output channel to: {result.get('output_routing_channel', channel_name)}"
+    except Exception as e:
+        logger.error(f"Error setting track output channel: {str(e)}")
+        return f"Error setting track output channel: {str(e)}"
 
 
 @mcp.tool()

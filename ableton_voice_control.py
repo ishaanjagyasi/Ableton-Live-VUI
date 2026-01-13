@@ -28,6 +28,60 @@ CHANNELS = 1
 FORMAT = pyaudio.paInt16
 
 class AbletonVoiceControl:
+    # Tool categories for smart filtering
+    TOOL_CATEGORIES = {
+        # Always included (essential)
+        "essential": ["get_session_info", "get_track_info"],
+
+        # Playback/Transport
+        "playback": ["start_playback", "stop_playback", "set_tempo"],
+
+        # Clips
+        "clips": ["create_clip", "add_notes_to_clip", "set_clip_name", "fire_clip", "stop_clip"],
+
+        # Track creation/management
+        "track_management": ["create_midi_track", "create_audio_track", "delete_track",
+                            "duplicate_track", "set_track_name", "set_track_color"],
+
+        # Track mixer
+        "mixer": ["set_track_volume", "set_track_pan", "arm_track", "mute_track", "solo_track"],
+
+        # Routing
+        "routing": ["get_track_routing_options", "set_track_output_routing", "set_track_input_routing",
+                   "set_track_input_channel", "set_track_output_channel", "set_track_monitoring"],
+
+        # Grouping
+        "grouping": ["create_track_group", "create_grouped_tracks"],
+
+        # Sends/Returns
+        "sends": ["get_return_tracks_info", "get_track_sends", "set_track_send",
+                 "create_return_track", "set_return_track_name", "delete_return_track"],
+
+        # Devices
+        "devices": ["get_device_parameters", "set_device_parameter", "load_instrument_or_effect",
+                   "load_device_by_name", "load_drum_kit"],
+
+        # Browser
+        "browser": ["get_browser_tree", "get_browser_items_at_path", "get_all_browser_items",
+                   "fuzzy_search_browser"],
+    }
+
+    # Keyword patterns to categories mapping
+    KEYWORD_PATTERNS = {
+        "playback": ["play", "stop", "pause", "start", "tempo", "bpm"],
+        "clips": ["clip", "note", "fire", "launch", "trigger"],
+        "track_management": ["create track", "new track", "add track", "delete track",
+                            "remove track", "duplicate", "rename", "color"],
+        "mixer": ["volume", "pan", "mute", "solo", "arm", "record", "loud", "quiet", "level"],
+        "routing": ["input", "output", "routing", "route", "channel", "monitor", "ext"],
+        "grouping": ["group", "bus", "submix"],
+        "sends": ["send", "return", "aux", "reverb send", "delay send"],
+        "devices": ["device", "effect", "plugin", "eq", "compressor", "reverb", "delay",
+                   "filter", "synth", "instrument", "parameter", "knob", "frequency", "gain",
+                   "threshold", "attack", "release", "ratio", "saturator", "limiter", "gate"],
+        "browser": ["browse", "search", "find", "load"],
+    }
+
     def __init__(self):
         # Use OpenRouter with OpenAI-compatible API
         self.llm_client = AsyncOpenAI(
@@ -43,6 +97,7 @@ class AbletonVoiceControl:
         self.mcp_session = None
         self.available_tools = []
         self.openai_tools = []  # Cached OpenAI-format tools
+        self.openai_tools_by_name = {}  # Quick lookup by name
 
     async def connect_mcp(self):
         """Connect to MCP server and load all available tools dynamically"""
@@ -68,8 +123,9 @@ class AbletonVoiceControl:
 
         # Pre-convert tools to OpenAI format ONCE (optimization)
         self.openai_tools = []
+        self.openai_tools_by_name = {}
         for tool in self.available_tools:
-            self.openai_tools.append({
+            tool_dict = {
                 "type": "function",
                 "function": {
                     "name": tool.name,
@@ -79,7 +135,9 @@ class AbletonVoiceControl:
                         "properties": {}
                     }
                 }
-            })
+            }
+            self.openai_tools.append(tool_dict)
+            self.openai_tools_by_name[tool.name] = tool_dict
 
         print(f"✅ Connected! Loaded {len(self.openai_tools)} tools from MCP server")
         print("Available commands:", ", ".join([tool.name for tool in self.available_tools[:10]]))
@@ -93,6 +151,40 @@ class AbletonVoiceControl:
         if hasattr(self, 'stdio_context'):
             await self.stdio_context.__aexit__(None, None, None)
 
+    def filter_tools_for_command(self, command):
+        """Filter tools based on keywords in the command. Returns a subset of tools."""
+        command_lower = command.lower()
+        matched_categories = set()
+
+        # Always include essential tools
+        matched_categories.add("essential")
+
+        # Match keywords to categories
+        for category, keywords in self.KEYWORD_PATTERNS.items():
+            for keyword in keywords:
+                if keyword in command_lower:
+                    matched_categories.add(category)
+                    break
+
+        # If no specific categories matched, include all tools (fallback)
+        if matched_categories == {"essential"}:
+            print(f"📦 Using all {len(self.openai_tools)} tools (no specific category matched)")
+            return self.openai_tools
+
+        # Build filtered tool list
+        filtered_tools = []
+        tool_names_added = set()
+
+        for category in matched_categories:
+            if category in self.TOOL_CATEGORIES:
+                for tool_name in self.TOOL_CATEGORIES[category]:
+                    if tool_name in self.openai_tools_by_name and tool_name not in tool_names_added:
+                        filtered_tools.append(self.openai_tools_by_name[tool_name])
+                        tool_names_added.add(tool_name)
+
+        print(f"📦 Filtered to {len(filtered_tools)} tools (categories: {', '.join(matched_categories)})")
+        return filtered_tools
+
     async def process_command(self, command):
         """Process voice command with OpenRouter and execute via MCP (natural multi-turn loop)."""
         if not command:
@@ -101,7 +193,8 @@ class AbletonVoiceControl:
         print(f"\n🎤 Processing: {command}")
 
         try:
-            # Use cached OpenAI-format tools (converted once at startup)
+            # Filter tools based on command keywords (optimization)
+            filtered_tools = self.filter_tools_for_command(command)
 
             # System prompt for Ableton control - optimized for speed
             system_prompt = """You are an Ableton Live controller. Execute user commands efficiently.
@@ -137,7 +230,7 @@ RULES:
             response = await self.llm_client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=messages,
-                tools=self.openai_tools,
+                tools=filtered_tools,
                 tool_choice="auto",
                 max_tokens=2000
             )
@@ -165,7 +258,7 @@ RULES:
                     llm_response = await self.llm_client.chat.completions.create(
                         model=LLM_MODEL,
                         messages=messages,
-                        tools=self.openai_tools,
+                        tools=filtered_tools,
                         tool_choice="auto",
                         max_tokens=2000
                     )
