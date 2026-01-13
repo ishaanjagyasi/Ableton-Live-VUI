@@ -105,7 +105,8 @@ class AbletonConnection:
             "create_clip", "add_notes_to_clip", "set_clip_name",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
             "start_playback", "stop_playback", "load_instrument_or_effect",
-            "set_track_output_routing", "set_track_input_routing", "set_track_monitoring"
+            "set_track_output_routing", "set_track_input_routing", "set_track_monitoring",
+            "set_track_send", "create_return_track", "set_return_track_name", "delete_return_track"
         ]
         
         try:
@@ -1234,6 +1235,171 @@ def load_device_by_name(ctx: Context, track_index: int, device_name: str, catego
     except Exception as e:
         logger.error(f"Error loading device by name: {str(e)}")
         return f"Error loading device by name: {str(e)}"
+
+
+# ==================== SEND/RETURN TRACK TOOLS ====================
+
+@mcp.tool()
+def get_return_tracks_info(ctx: Context) -> str:
+    """
+    Get information about all return tracks in the session.
+
+    Returns a list of return tracks with:
+    - index: The return track index (0, 1, 2...)
+    - letter: The letter designation (A, B, C...)
+    - name: The return track name
+    - volume: Current volume level
+    - panning: Current panning
+
+    Use this to see what return tracks exist and their names before setting up sends.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_return_tracks_info", {})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting return tracks info: {str(e)}")
+        return f"Error getting return tracks info: {str(e)}"
+
+
+@mcp.tool()
+def get_track_sends(ctx: Context, track_index: int) -> str:
+    """
+    Get the send levels for a specific track.
+
+    Parameters:
+    - track_index: The index of the track to get sends for
+
+    Returns information about each send:
+    - index: Send index (0, 1, 2...)
+    - letter: Send letter (A, B, C...)
+    - return_track_name: Name of the destination return track
+    - normalized_value: Current send level (0.0 to 1.0)
+
+    Use this to see what sends are available and their current levels.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_track_sends", {"track_index": track_index})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting track sends: {str(e)}")
+        return f"Error getting track sends: {str(e)}"
+
+
+@mcp.tool()
+def set_track_send(ctx: Context, track_index: int, send_identifier: str, value: float) -> str:
+    """
+    Set a send level for a track.
+
+    Parameters:
+    - track_index: The index of the track
+    - send_identifier: Can be:
+        - A letter ("A", "B", "C"...) for the send
+        - A return track name (e.g., "Reverb", "Delay") - will match partially
+        - An index as string ("0", "1", "2"...)
+    - value: Normalized send level from 0.0 (off) to 1.0 (full)
+
+    Examples:
+    - set_track_send(0, "A", 0.5) - Set track 0's Send A to 50%
+    - set_track_send(0, "Reverb", 0.7) - Send track 0 to the return track named "Reverb" at 70%
+    - set_track_send(2, "B", 1.0) - Set track 2's Send B to 100%
+
+    Use get_track_sends first to see available sends for a track.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_track_send", {
+            "track_index": track_index,
+            "send_identifier": send_identifier,
+            "value": value
+        })
+        letter = result.get('send_letter', send_identifier)
+        return_name = result.get('return_track_name', '')
+        percentage = int(value * 100)
+        if return_name:
+            return f"Set Send {letter} ({return_name}) on track {track_index} to {percentage}%"
+        else:
+            return f"Set Send {letter} on track {track_index} to {percentage}%"
+    except Exception as e:
+        logger.error(f"Error setting track send: {str(e)}")
+        return f"Error setting track send: {str(e)}"
+
+
+@mcp.tool()
+def create_return_track(ctx: Context, name: str = None) -> str:
+    """
+    Create a new return track.
+
+    Parameters:
+    - name: Optional name for the return track (e.g., "Reverb", "Delay", "Chorus")
+           If not provided, Ableton will use the default name.
+
+    The new return track will be assigned the next available letter (A, B, C...).
+    All tracks in the session will automatically get a new send knob for this return.
+
+    Example:
+    - create_return_track("Reverb") - Creates return track "A Reverb" (or B, C, etc.)
+    """
+    try:
+        ableton = get_ableton_connection()
+        params = {}
+        if name:
+            params["name"] = name
+        result = ableton.send_command("create_return_track", params)
+        letter = result.get('letter', '?')
+        track_name = result.get('name', name or 'New Return')
+        return f"Created return track {letter}: '{track_name}'"
+    except Exception as e:
+        logger.error(f"Error creating return track: {str(e)}")
+        return f"Error creating return track: {str(e)}"
+
+
+@mcp.tool()
+def set_return_track_name(ctx: Context, return_track_index: int, name: str) -> str:
+    """
+    Set the name of a return track.
+
+    Parameters:
+    - return_track_index: The index of the return track (0 for A, 1 for B, etc.)
+    - name: The new name for the return track
+
+    The name will appear as "[Letter] [Name]" in Ableton (e.g., "A Reverb").
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_return_track_name", {
+            "return_track_index": return_track_index,
+            "name": name
+        })
+        letter = result.get('letter', '?')
+        return f"Renamed return track {letter} to: '{name}'"
+    except Exception as e:
+        logger.error(f"Error setting return track name: {str(e)}")
+        return f"Error setting return track name: {str(e)}"
+
+
+@mcp.tool()
+def delete_return_track(ctx: Context, return_track_index: int) -> str:
+    """
+    Delete a return track.
+
+    Parameters:
+    - return_track_index: The index of the return track to delete (0 for A, 1 for B, etc.)
+
+    Warning: This will remove the return track and all send connections to it.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("delete_return_track", {
+            "return_track_index": return_track_index
+        })
+        letter = result.get('deleted_letter', '?')
+        name = result.get('deleted_name', '')
+        return f"Deleted return track {letter}: '{name}'"
+    except Exception as e:
+        logger.error(f"Error deleting return track: {str(e)}")
+        return f"Error deleting return track: {str(e)}"
 
 
 # Main execution

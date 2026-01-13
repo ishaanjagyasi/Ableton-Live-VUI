@@ -240,7 +240,9 @@ class AbletonMCP(ControlSurface):
                                  "get_all_browser_items", "fuzzy_search_browser", "load_device_by_name",
                                  "set_device_parameter",
                                  "get_track_routing_options", "set_track_output_routing",
-                                 "set_track_input_routing", "set_track_monitoring"]:
+                                 "set_track_input_routing", "set_track_monitoring",
+                                 "get_return_tracks_info", "get_track_sends", "set_track_send",
+                                 "create_return_track", "set_return_track_name", "delete_return_track"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -363,6 +365,26 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             monitoring_state = params.get("monitoring_state", 1)
                             result = self._set_track_monitoring(track_index, monitoring_state)
+                        elif command_type == "get_return_tracks_info":
+                            result = self._get_return_tracks_info()
+                        elif command_type == "get_track_sends":
+                            track_index = params.get("track_index", 0)
+                            result = self._get_track_sends(track_index)
+                        elif command_type == "set_track_send":
+                            track_index = params.get("track_index", 0)
+                            send_identifier = params.get("send_identifier", 0)
+                            value = params.get("value", 0.0)
+                            result = self._set_track_send(track_index, send_identifier, value)
+                        elif command_type == "create_return_track":
+                            name = params.get("name", None)
+                            result = self._create_return_track(name)
+                        elif command_type == "set_return_track_name":
+                            return_track_index = params.get("return_track_index", 0)
+                            name = params.get("name", "")
+                            result = self._set_return_track_name(return_track_index, name)
+                        elif command_type == "delete_return_track":
+                            return_track_index = params.get("return_track_index", 0)
+                            result = self._delete_return_track(return_track_index)
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -1494,6 +1516,226 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error setting track monitoring: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    # Send/Return Track Methods
+
+    def _get_return_tracks_info(self):
+        """Get information about all return tracks"""
+        try:
+            return_tracks = []
+            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+            for i, return_track in enumerate(self._song.return_tracks):
+                letter = letters[i] if i < len(letters) else str(i)
+                return_tracks.append({
+                    "index": i,
+                    "letter": letter,
+                    "name": return_track.name,
+                    "color_index": return_track.color_index,
+                    "is_visible": return_track.is_visible if hasattr(return_track, 'is_visible') else True,
+                    "volume": return_track.mixer_device.volume.value if return_track.mixer_device else None,
+                    "panning": return_track.mixer_device.panning.value if return_track.mixer_device else None
+                })
+
+            return {
+                "return_track_count": len(return_tracks),
+                "return_tracks": return_tracks
+            }
+        except Exception as e:
+            self.log_message("Error getting return tracks info: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _get_track_sends(self, track_index):
+        """Get send levels for a track"""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+            sends = []
+            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+            # Get the sends from the mixer device
+            if track.mixer_device and track.mixer_device.sends:
+                for i, send in enumerate(track.mixer_device.sends):
+                    letter = letters[i] if i < len(letters) else str(i)
+                    # Get corresponding return track name if available
+                    return_track_name = ""
+                    if i < len(self._song.return_tracks):
+                        return_track_name = self._song.return_tracks[i].name
+
+                    # Calculate normalized value (0-1)
+                    normalized_value = 0.0
+                    if (send.max - send.min) != 0:
+                        normalized_value = (send.value - send.min) / (send.max - send.min)
+
+                    sends.append({
+                        "index": i,
+                        "letter": letter,
+                        "name": send.name,
+                        "return_track_name": return_track_name,
+                        "value": send.value,
+                        "normalized_value": normalized_value,
+                        "min": send.min,
+                        "max": send.max
+                    })
+
+            return {
+                "track_index": track_index,
+                "track_name": track.name,
+                "send_count": len(sends),
+                "sends": sends
+            }
+        except Exception as e:
+            self.log_message("Error getting track sends: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _set_track_send(self, track_index, send_identifier, value):
+        """
+        Set a send level for a track.
+        send_identifier can be:
+        - An integer index (0, 1, 2...)
+        - A letter string ("A", "B", "C"...)
+        - A return track name to match against
+        value should be normalized (0.0 to 1.0)
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            if not track.mixer_device or not track.mixer_device.sends:
+                raise ValueError("Track has no sends available")
+
+            sends = track.mixer_device.sends
+            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+            # Resolve send_identifier to an index
+            send_index = None
+
+            if isinstance(send_identifier, int):
+                send_index = send_identifier
+            elif isinstance(send_identifier, str):
+                send_identifier_upper = send_identifier.upper().strip()
+
+                # Check if it's a letter (A, B, C...)
+                if len(send_identifier_upper) == 1 and send_identifier_upper in letters:
+                    send_index = letters.index(send_identifier_upper)
+                else:
+                    # Try to match against return track names
+                    for i, return_track in enumerate(self._song.return_tracks):
+                        # Check if the identifier matches part of the return track name
+                        if send_identifier.lower() in return_track.name.lower():
+                            send_index = i
+                            break
+
+            if send_index is None:
+                raise ValueError("Could not resolve send identifier: {0}".format(send_identifier))
+
+            if send_index < 0 or send_index >= len(sends):
+                raise IndexError("Send index {0} out of range (0-{1})".format(send_index, len(sends) - 1))
+
+            # Validate value
+            if value < 0.0 or value > 1.0:
+                raise ValueError("Value must be between 0.0 and 1.0, got {0}".format(value))
+
+            send = sends[send_index]
+
+            # Convert normalized value to actual value
+            actual_value = send.min + value * (send.max - send.min)
+            send.value = actual_value
+
+            # Get return track info
+            letter = letters[send_index] if send_index < len(letters) else str(send_index)
+            return_track_name = ""
+            if send_index < len(self._song.return_tracks):
+                return_track_name = self._song.return_tracks[send_index].name
+
+            return {
+                "track_index": track_index,
+                "track_name": track.name,
+                "send_index": send_index,
+                "send_letter": letter,
+                "return_track_name": return_track_name,
+                "value": send.value,
+                "normalized_value": value
+            }
+        except Exception as e:
+            self.log_message("Error setting track send: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _create_return_track(self, name=None):
+        """Create a new return track with optional name"""
+        try:
+            # Create the return track
+            new_return_track = self._song.create_return_track()
+
+            # Get the index of the new return track
+            new_index = len(self._song.return_tracks) - 1
+            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            letter = letters[new_index] if new_index < len(letters) else str(new_index)
+
+            # Set name if provided
+            if name:
+                new_return_track.name = name
+
+            return {
+                "index": new_index,
+                "letter": letter,
+                "name": new_return_track.name
+            }
+        except Exception as e:
+            self.log_message("Error creating return track: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _set_return_track_name(self, return_track_index, name):
+        """Set the name of a return track"""
+        try:
+            if return_track_index < 0 or return_track_index >= len(self._song.return_tracks):
+                raise IndexError("Return track index out of range")
+
+            return_track = self._song.return_tracks[return_track_index]
+            return_track.name = name
+
+            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            letter = letters[return_track_index] if return_track_index < len(letters) else str(return_track_index)
+
+            return {
+                "index": return_track_index,
+                "letter": letter,
+                "name": return_track.name
+            }
+        except Exception as e:
+            self.log_message("Error setting return track name: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _delete_return_track(self, return_track_index):
+        """Delete a return track by index"""
+        try:
+            if return_track_index < 0 or return_track_index >= len(self._song.return_tracks):
+                raise IndexError("Return track index out of range")
+
+            letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            letter = letters[return_track_index] if return_track_index < len(letters) else str(return_track_index)
+            name = self._song.return_tracks[return_track_index].name
+
+            self._song.delete_return_track(return_track_index)
+
+            return {
+                "deleted_index": return_track_index,
+                "deleted_letter": letter,
+                "deleted_name": name
+            }
+        except Exception as e:
+            self.log_message("Error deleting return track: " + str(e))
             self.log_message(traceback.format_exc())
             raise
 
