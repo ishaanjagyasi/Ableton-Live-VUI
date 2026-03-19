@@ -243,7 +243,9 @@ class AbletonMCP(ControlSurface):
                                  "set_track_input_routing", "set_track_monitoring",
                                  "set_track_input_channel", "set_track_output_channel",
                                  "get_return_tracks_info", "get_track_sends", "set_track_send",
-                                 "create_return_track", "set_return_track_name", "delete_return_track"]:
+                                 "create_return_track", "set_return_track_name", "delete_return_track",
+                                 "load_device_on_return_track",
+                                 "get_return_track_device_parameters", "set_return_track_device_parameter"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -394,6 +396,21 @@ class AbletonMCP(ControlSurface):
                         elif command_type == "delete_return_track":
                             return_track_index = params.get("return_track_index", 0)
                             result = self._delete_return_track(return_track_index)
+                        elif command_type == "load_device_on_return_track":
+                            return_track_index = params.get("return_track_index", 0)
+                            device_name = params.get("device_name", "")
+                            category_name = params.get("category_name", "audio_effects")
+                            result = self._load_device_on_return_track(return_track_index, device_name, category_name)
+                        elif command_type == "get_return_track_device_parameters":
+                            return_track_index = params.get("return_track_index", 0)
+                            device_index = params.get("device_index", 0)
+                            result = self._get_return_track_device_parameters(return_track_index, device_index)
+                        elif command_type == "set_return_track_device_parameter":
+                            return_track_index = params.get("return_track_index", 0)
+                            device_index = params.get("device_index", 0)
+                            parameter_name = params.get("parameter_name", "")
+                            value = params.get("value", 0.0)
+                            result = self._set_return_track_device_parameter(return_track_index, device_index, parameter_name, value)
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -572,6 +589,23 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting device parameters: " + str(e))
             raise
 
+    def _normalize_param_name(self, name):
+        """Normalize parameter name for fuzzy matching - strip spaces, slashes, etc."""
+        return name.lower().replace("/", "").replace(" ", "").replace("-", "").replace("_", "")
+
+    def _find_param_by_name(self, device, parameter_name):
+        """Find a parameter on a device by name with fuzzy matching."""
+        # Try exact case-insensitive match first
+        for param in device.parameters:
+            if param.name.lower() == parameter_name.lower():
+                return param
+        # Try normalized match (handles "Dry/Wet" vs "Dry Wet" etc.)
+        normalized_search = self._normalize_param_name(parameter_name)
+        for param in device.parameters:
+            if self._normalize_param_name(param.name) == normalized_search:
+                return param
+        return None
+
     def _set_device_parameter(self, track_index, device_index, parameter_name, value):
         """Set a parameter value on a device"""
         try:
@@ -585,12 +619,8 @@ class AbletonMCP(ControlSurface):
 
             device = track.devices[device_index]
 
-            # Find parameter by name (case-insensitive)
-            param_found = None
-            for param in device.parameters:
-                if param.name.lower() == parameter_name.lower():
-                    param_found = param
-                    break
+            # Find parameter by name (with fuzzy matching)
+            param_found = self._find_param_by_name(device, parameter_name)
 
             if not param_found:
                 raise ValueError(f"Parameter '{parameter_name}' not found on device '{device.name}'")
@@ -1327,6 +1357,125 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error loading device by name: {0}".format(str(e)))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _get_return_track_device_parameters(self, return_track_index, device_index):
+        """Get all parameters for a device on a return track"""
+        try:
+            if return_track_index < 0 or return_track_index >= len(self._song.return_tracks):
+                raise IndexError("Return track index out of range")
+
+            track = self._song.return_tracks[return_track_index]
+
+            if device_index < 0 or device_index >= len(track.devices):
+                raise IndexError("Device index out of range")
+
+            device = track.devices[device_index]
+
+            parameters = []
+            for param_index, param in enumerate(device.parameters):
+                parameters.append({
+                    "index": param_index,
+                    "name": param.name,
+                    "value": param.value,
+                    "min": param.min,
+                    "max": param.max,
+                    "is_enabled": param.is_enabled,
+                    "value_string": param.str_for_value(param.value)
+                })
+
+            return {
+                "return_track_index": return_track_index,
+                "device_index": device_index,
+                "device_name": device.name,
+                "parameters": parameters
+            }
+        except Exception as e:
+            self.log_message("Error getting return track device parameters: " + str(e))
+            raise
+
+    def _set_return_track_device_parameter(self, return_track_index, device_index, parameter_name, value):
+        """Set a parameter value on a device on a return track"""
+        try:
+            if return_track_index < 0 or return_track_index >= len(self._song.return_tracks):
+                raise IndexError("Return track index out of range")
+
+            track = self._song.return_tracks[return_track_index]
+
+            if device_index < 0 or device_index >= len(track.devices):
+                raise IndexError("Device index out of range")
+
+            device = track.devices[device_index]
+
+            param_found = self._find_param_by_name(device, parameter_name)
+
+            if not param_found:
+                raise ValueError("Parameter '{0}' not found on device '{1}'".format(parameter_name, device.name))
+
+            clamped_value = max(param_found.min, min(param_found.max, value))
+            param_found.value = clamped_value
+
+            return {
+                "return_track_index": return_track_index,
+                "device_index": device_index,
+                "device_name": device.name,
+                "parameter_name": param_found.name,
+                "old_value": param_found.value,
+                "new_value": clamped_value,
+                "value_string": param_found.str_for_value(clamped_value)
+            }
+        except Exception as e:
+            self.log_message("Error setting return track device parameter: " + str(e))
+            raise
+
+    def _load_device_on_return_track(self, return_track_index, device_name, category_name):
+        """Load a device onto a return track by searching for it by name"""
+        try:
+            if return_track_index < 0 or return_track_index >= len(self._song.return_tracks):
+                raise IndexError("Return track index out of range")
+
+            # Search for the device
+            search_result = self._fuzzy_search_browser(device_name, category_name)
+
+            if not search_result.get("found"):
+                return {
+                    "loaded": False,
+                    "error": search_result.get("message", "Device not found"),
+                    "top_matches": search_result.get("top_matches", [])
+                }
+
+            # Get the matched item
+            matched_item = search_result["match"]
+            uri = matched_item["uri"]
+
+            # Load the device using the URI
+            return_track = self._song.return_tracks[return_track_index]
+            app = self.application()
+
+            # Find the browser item by URI
+            item = self._find_browser_item_by_uri(app.browser, uri)
+
+            if not item:
+                raise ValueError("Browser item with URI '{0}' not found".format(uri))
+
+            # Select the return track
+            self._song.view.selected_track = return_track
+
+            # Load the item
+            app.browser.load_item(item)
+
+            return {
+                "loaded": True,
+                "device_name": matched_item["name"],
+                "searched_name": device_name,
+                "confidence": search_result["confidence"],
+                "return_track_name": return_track.name,
+                "return_track_index": return_track_index,
+                "uri": uri
+            }
+        except Exception as e:
+            self.log_message("Error loading device on return track: {0}".format(str(e)))
             self.log_message(traceback.format_exc())
             raise
 

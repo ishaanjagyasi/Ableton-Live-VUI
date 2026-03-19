@@ -1296,6 +1296,92 @@ def load_device_by_name(ctx: Context, track_index: int, device_name: str, catego
         return f"Error loading device by name: {str(e)}"
 
 
+@mcp.tool()
+def load_device_on_return_track(ctx: Context, return_track_index: int, device_name: str, category_name: str = "audio_effects") -> str:
+    """
+    Load a device onto a RETURN track by searching for it by name (with fuzzy matching).
+
+    Parameters:
+    - return_track_index: Index of the return track (0 for A, 1 for B, etc.)
+    - device_name: Name of the device to load (e.g., "Reverb", "Delay", "EQ Eight")
+    - category_name: Category to search in (audio_effects, midi_effects, instruments, drums, sounds)
+
+    IMPORTANT: Use this instead of load_device_by_name when loading devices onto return tracks.
+    Return tracks have a separate index space from regular tracks.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("load_device_on_return_track", {
+            "return_track_index": return_track_index,
+            "device_name": device_name,
+            "category_name": category_name
+        })
+
+        if result.get("loaded"):
+            return f"Loaded '{result['device_name']}' on return track {return_track_index} (confidence: {result['confidence']:.2f})"
+        else:
+            error = result.get("error", "Unknown error")
+            top_matches = result.get("top_matches", [])
+            if top_matches:
+                matches_str = "\n".join([f"  - {m['name']} (confidence: {m['confidence']:.2f})" for m in top_matches])
+                return f"Failed to load device on return track: {error}\nDid you mean:\n{matches_str}"
+            else:
+                return f"Failed to load device on return track: {error}"
+    except Exception as e:
+        logger.error(f"Error loading device on return track: {str(e)}")
+        return f"Error loading device on return track: {str(e)}"
+
+
+@mcp.tool()
+def get_return_track_device_parameters(ctx: Context, return_track_index: int, device_index: int) -> str:
+    """
+    Get all parameters for a device on a return track.
+
+    Parameters:
+    - return_track_index: Index of the return track (0 for A, 1 for B, etc.)
+    - device_index: The index of the device on the return track (0 = first device)
+
+    Use this to find parameter names and ranges before setting them with set_return_track_device_parameter.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_return_track_device_parameters", {
+            "return_track_index": return_track_index,
+            "device_index": device_index
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting return track device parameters: {str(e)}")
+        return f"Error getting return track device parameters: {str(e)}"
+
+
+@mcp.tool()
+def set_return_track_device_parameter(ctx: Context, return_track_index: int, device_index: int, parameter_name: str, value: float) -> str:
+    """
+    Set a parameter value on a device on a return track.
+
+    Parameters:
+    - return_track_index: Index of the return track (0 for A, 1 for B, etc.)
+    - device_index: The index of the device on the return track (0 = first device)
+    - parameter_name: The name of the parameter to set (case-insensitive, e.g. "Dry/Wet")
+    - value: The value to set (will be clamped to valid range)
+
+    Common parameters: "Dry/Wet" (0.0-1.0), "Decay Time", "Feedback", etc.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_return_track_device_parameter", {
+            "return_track_index": return_track_index,
+            "device_index": device_index,
+            "parameter_name": parameter_name,
+            "value": value
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting return track device parameter: {str(e)}")
+        return f"Error setting return track device parameter: {str(e)}"
+
+
 # ==================== SEND/RETURN TRACK TOOLS ====================
 
 @mcp.tool()
